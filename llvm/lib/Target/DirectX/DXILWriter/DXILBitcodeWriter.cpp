@@ -14,6 +14,7 @@
 #include "DXILValueEnumerator.h"
 #include "DirectXIRPasses/DXILDebugInfo.h"
 #include "DirectXIRPasses/PointerTypeAnalysis.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/Bitcode/BitcodeCommon.h"
@@ -140,8 +141,9 @@ public:
                     const DXILDebugInfoMap &DebugInfo)
       : I8Ty(Type::getInt8Ty(M.getContext())),
         I8PtrTy(TypedPointerType::get(I8Ty, 0)), Stream(Stream),
-        StrtabBuilder(StrtabBuilder), M(M), VE(M, I8PtrTy, DebugInfo),
-        Buffer(Buffer), BitcodeStartBit(Stream.GetCurrentBitNo()),
+        StrtabBuilder(StrtabBuilder), M(M),
+        VE(M, Type::getVoidTy(M.getContext()), DebugInfo), Buffer(Buffer),
+        BitcodeStartBit(Stream.GetCurrentBitNo()),
         PointerMap(PointerTypeAnalysis::run(M)), DebugInfo(DebugInfo) {
     GlobalValueId = VE.getValues().size();
     // Enumerate the typed pointers
@@ -1080,14 +1082,13 @@ void DXILBitcodeWriter::writeTypeTable() {
       break;
     }
     case Type::PointerTyID: {
-      // POINTER: [pointee type, address space]
-      // Emitting an empty struct type for the pointer's type allows this to be
-      // order-independent. Non-struct types must be emitted in bitcode before
-      // they can be referenced.
-      TypeVals.push_back(false);
-      Code = bitc::TYPE_CODE_OPAQUE;
-      writeStringRecord(Stream, bitc::TYPE_CODE_STRUCT_NAME,
-                        "dxilOpaquePtrReservedName", StructNameAbbrev);
+      // DXIL bitcode is typed-pointer; encode opaque pointers as i8*.
+      Code = bitc::TYPE_CODE_POINTER;
+      TypeVals.push_back(getTypeID(Type::getInt8Ty(T->getContext())));
+      unsigned AddressSpace = cast<PointerType>(T)->getAddressSpace();
+      TypeVals.push_back(AddressSpace);
+      if (AddressSpace == 0)
+        AbbrevToUse = PtrAbbrev;
       break;
     }
     case Type::FunctionTyID: {
@@ -1178,11 +1179,10 @@ void DXILBitcodeWriter::writeValueSymbolTableForwardDecl() {}
 void DXILBitcodeWriter::writeModuleInfo() {
   // Emit various pieces of data attached to a module.
 
-  // We need to hardcode a triple and datalayout that's compatible with the
-  // historical DXIL triple and datalayout from DXC.
+  // DXC DXIL datalayout (see dxc -dumpbin).
   StringRef Triple = "dxil-ms-dx";
-  StringRef DL = "e-m:e-p:32:32-i1:32-i8:8-i16:16-i32:32-i64:64-"
-                 "f16:16-f32:32-f64:64-n8:16:32:64";
+  StringRef DL = "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-"
+                 "f16:32-f32:32-f64:64-n8:16:32:64";
   writeStringRecord(Stream, bitc::MODULE_CODE_TRIPLE, Triple, 0 /*TODO*/);
   writeStringRecord(Stream, bitc::MODULE_CODE_DATALAYOUT, DL, 0 /*TODO*/);
 
@@ -1813,20 +1813,14 @@ void DXILBitcodeWriter::writeModuleMetadata() {
   if (!VE.hasMDs() && M.named_metadata_empty())
     return;
 
-  Stream.EnterSubblock(bitc::METADATA_BLOCK_ID, 5);
+  // DXC uses codeLen=3 for the main METADATA_BLOCK.
+  Stream.EnterSubblock(bitc::METADATA_BLOCK_ID, 3);
 
-  // Emit all abbrevs upfront, so that the reader can jump in the middle of the
-  // block and load any metadata.
-  std::vector<unsigned> MDAbbrevs;
-
-  MDAbbrevs.resize(MetadataAbbrev::LastPlusOne);
-  MDAbbrevs[MetadataAbbrev::DILocationAbbrevID] = createDILocationAbbrev();
-  MDAbbrevs[MetadataAbbrev::GenericDINodeAbbrevID] =
-      createGenericDINodeAbbrev();
+  SmallVector<uint64_t, 64> Record;
+  writeMetadataStrings(VE.getMDStrings(), Record);
 
   unsigned NameAbbrev = 0;
   if (!M.named_metadata_empty()) {
-    // Abbrev for METADATA_NAME.
     std::shared_ptr<BitCodeAbbrev> Abbv = std::make_shared<BitCodeAbbrev>();
     Abbv->Add(BitCodeAbbrevOp(bitc::METADATA_NAME));
     Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Array));
@@ -1834,8 +1828,8 @@ void DXILBitcodeWriter::writeModuleMetadata() {
     NameAbbrev = Stream.EmitAbbrev(std::move(Abbv));
   }
 
-  SmallVector<uint64_t, 64> Record;
-  writeMetadataStrings(VE.getMDStrings(), Record);
+  std::vector<unsigned> MDAbbrevs;
+  MDAbbrevs.resize(MetadataAbbrev::LastPlusOne, 0);
 
   std::vector<uint64_t> IndexPos;
   IndexPos.reserve(VE.getNonMDStrings().size());
@@ -1919,21 +1913,68 @@ void DXILBitcodeWriter::writeFunctionMetadataAttachment(const Function &F) {
 void DXILBitcodeWriter::writeModuleMetadataKinds() {
   SmallVector<uint64_t, 64> Record;
 
-  // Write metadata kinds
-  // METADATA_KIND - [n x [id, name]]
+  // METADATA_KIND - [n x [id, name]]. DXC's baseline table is IDs 0..15.
+  static constexpr StringRef DXCBaselineKinds[] = {
+      "dbg",
+      "tbaa",
+      "prof",
+      "fpmath",
+      "range",
+      "tbaa.struct",
+      "invariant.load",
+      "alias.scope",
+      "noalias",
+      "nontemporal",
+      "llvm.mem.parallel_loop_access",
+      "nonnull",
+      "dereferenceable",
+      "dereferenceable_or_null",
+      "dx.dbg.varlayout",
+      "dx.temp",
+  };
+
   SmallVector<StringRef, 8> Names;
   M.getMDKindNames(Names);
 
-  if (Names.empty())
-    return;
+  DenseSet<unsigned> UsedIDs;
+  for (const Function &F : M) {
+    for (const BasicBlock &BB : F) {
+      for (const Instruction &I : BB) {
+        SmallVector<std::pair<unsigned, MDNode *>, 4> MDs;
+        I.getAllMetadata(MDs);
+        for (const auto &MD : MDs)
+          UsedIDs.insert(MD.first);
+      }
+    }
+  }
 
   Stream.EnterSubblock(bitc::METADATA_BLOCK_ID, 3);
 
-  for (unsigned MDKindID = 0, e = Names.size(); MDKindID != e; ++MDKindID) {
-    Record.push_back(MDKindID);
-    StringRef KName = Names[MDKindID];
+  for (unsigned ID = 0; ID < std::size(DXCBaselineKinds); ++ID) {
+    Record.push_back(ID);
+    StringRef KName = DXCBaselineKinds[ID];
     Record.append(KName.begin(), KName.end());
+    Stream.EmitRecord(bitc::METADATA_KIND, Record, 0);
+    Record.clear();
+  }
 
+  for (unsigned MDKindID : UsedIDs) {
+    if (MDKindID < std::size(DXCBaselineKinds))
+      continue;
+    if (MDKindID >= Names.size())
+      continue;
+    StringRef KName = Names[MDKindID];
+    bool InBaseline = false;
+    for (StringRef Base : DXCBaselineKinds) {
+      if (KName == Base) {
+        InBaseline = true;
+        break;
+      }
+    }
+    if (InBaseline)
+      continue;
+    Record.push_back(MDKindID);
+    Record.append(KName.begin(), KName.end());
     Stream.EmitRecord(bitc::METADATA_KIND, Record, 0);
     Record.clear();
   }
@@ -2946,11 +2987,9 @@ void DXILBitcodeWriter::write() {
   // Emit constants.
   writeModuleConstants();
 
-  // Emit metadata.
-  writeModuleMetadataKinds();
-
-  // Emit metadata.
+  // Emit metadata. DXC writes named MD first, then the KIND table.
   writeModuleMetadata();
+  writeModuleMetadataKinds();
 
   // Emit names for globals/functions etc.
   // DXIL uses the same format for module-level value symbol table as for the

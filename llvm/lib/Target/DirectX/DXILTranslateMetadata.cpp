@@ -30,6 +30,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/VersionTuple.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Config/llvm-config.h"
 #include <cstdint>
 
 using namespace llvm;
@@ -305,6 +306,17 @@ static void emitValidatorVersionMD(Module &M, const ModuleMetadataInfo &MMDI) {
   ValVerNode->addOperand(MDNode::get(Ctx, MDVals));
 }
 
+// DXC always emits !llvm.ident; match for D3D12 driver compatibility.
+static void emitLLVMIdentMD(Module &M) {
+  if (M.getNamedMetadata("llvm.ident"))
+    return;
+  LLVMContext &Ctx = M.getContext();
+  std::string Ident = (Twine("llvm (") + LLVM_VERSION_STRING + ")").str();
+  Metadata *Str = MDString::get(Ctx, Ident);
+  M.getOrInsertNamedMetadata("llvm.ident")
+      ->addOperand(MDNode::get(Ctx, Str));
+}
+
 static void emitShaderModelVersionMD(Module &M,
                                      const ModuleMetadataInfo &MMDI) {
   LLVMContext &Ctx = M.getContext();
@@ -535,6 +547,7 @@ static void translateGlobalMetadata(Module &M, DXILResourceMap &DRM,
   emitValidatorVersionMD(M, MMDI);
   emitShaderModelVersionMD(M, MMDI);
   emitDXILVersionTupleMD(M, MMDI);
+  emitLLVMIdentMD(M);
   NamedMDNode *NamedResourceMD = emitResourceMetadata(M, DRM, DRTM);
   auto *ResourceMD =
       (NamedResourceMD != nullptr) ? NamedResourceMD->getOperand(0) : nullptr;
