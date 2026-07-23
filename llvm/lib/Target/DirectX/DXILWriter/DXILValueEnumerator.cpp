@@ -952,20 +952,7 @@ void ValueEnumerator::EnumerateValue(const Value *V) {
       Comdats.insert(C);
 
   // Enumerate the type of this value.
-  if (const Function *F = dyn_cast<Function>(V))
-    EnumerateType(
-        TypedPointerType::get(F->getFunctionType(), F->getAddressSpace()));
-  else if (const GlobalVariable *GV = dyn_cast<GlobalVariable>(V))
-    EnumerateType(
-        TypedPointerType::get(GV->getValueType(), GV->getAddressSpace()));
-  else if (const GlobalAlias *GA = dyn_cast<GlobalAlias>(V))
-    EnumerateType(
-        TypedPointerType::get(GA->getValueType(), GA->getAddressSpace()));
-  else if (const GlobalIFunc *GIF = dyn_cast<GlobalIFunc>(V))
-    EnumerateType(
-        TypedPointerType::get(GIF->getValueType(), GIF->getAddressSpace()));
-  else
-    EnumerateType(V->getType());
+  EnumerateType(V->getType());
 
   if (const Constant *C = dyn_cast<Constant>(V)) {
     if (isa<GlobalValue>(C)) {
@@ -1004,10 +991,6 @@ void ValueEnumerator::EnumerateValue(const Value *V) {
 }
 
 void ValueEnumerator::EnumerateType(Type *Ty) {
-  if (Ty->isPointerTy())
-    Ty = TypedPointerType::get(Type::getInt8Ty(Ty->getContext()),
-                               cast<PointerType>(Ty)->getAddressSpace());
-
   unsigned *TypeID = &TypeMap[Ty];
 
   // We've already seen this type.
@@ -1046,14 +1029,7 @@ void ValueEnumerator::EnumerateType(Type *Ty) {
 // Enumerate the types for the specified value.  If the value is a constant,
 // walk through it, enumerating the types of the constant.
 void ValueEnumerator::EnumerateOperandType(const Value *V) {
-  if (const Function *F = dyn_cast<Function>(V))
-    EnumerateType(
-        TypedPointerType::get(F->getFunctionType(), F->getAddressSpace()));
-  else if (const GlobalVariable *GV = dyn_cast<GlobalVariable>(V))
-    EnumerateType(
-        TypedPointerType::get(GV->getValueType(), GV->getAddressSpace()));
-  else
-    EnumerateType(V->getType());
+  EnumerateType(V->getType());
 
   assert(!isa<MetadataAsValue>(V) && "Unexpected metadata operand");
 
